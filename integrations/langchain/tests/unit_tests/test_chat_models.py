@@ -31,6 +31,7 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.completion_usage import CompletionUsage
 from openai.types.responses import (
     Response,
+    ResponseContentPartDoneEvent,
     ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseFunctionToolCallOutputItem,
@@ -40,6 +41,7 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
     ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
     ResponseUsage,
 )
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
@@ -1089,10 +1091,6 @@ def test_convert_responses_api_chunk_to_lc_chunk_message():
 
 def test_convert_responses_api_chunk_to_lc_chunk_skip_duplicate():
     """Test _convert_responses_api_chunk_to_lc_chunk skips duplicate text."""
-    previous_chunk = ResponseTextDeltaEvent.model_construct(
-        type="response.output_text.delta", item_id="item_123", delta="Hello"
-    )
-
     chunk = ResponseOutputItemDoneEvent.model_construct(
         type="response.output_item.done",
         item=ResponseOutputMessage.model_construct(
@@ -1102,15 +1100,25 @@ def test_convert_responses_api_chunk_to_lc_chunk_skip_duplicate():
         ),
     )
 
-    result = _convert_responses_api_chunk_to_lc_chunk(chunk, previous_chunk)
+    result = _convert_responses_api_chunk_to_lc_chunk(chunk, {"item_123": "Hello"})
     assert result is None
 
 
-@pytest.mark.parametrize("prev_type", ["response.output_text.done", "response.content_part.done"])
-def test_convert_responses_api_chunk_to_lc_chunk_skip_duplicate_after_terminator(prev_type):
-    """Text terminators between the last delta and output_item.done still skip the repeat."""
-    previous_chunk = ResponseTextDeltaEvent.model_construct(type=prev_type, item_id="item_123")
-
+@pytest.mark.parametrize(
+    "terminator_type", ["response.output_text.done", "response.content_part.done"]
+)
+def test_convert_responses_api_chunk_to_lc_chunk_keeps_text_without_delta(terminator_type):
+    """A same-item terminator does not prove that the endpoint streamed the text."""
+    if terminator_type == "response.output_text.done":
+        terminator = ResponseTextDoneEvent.model_construct(
+            type=terminator_type, item_id="item_123", text="Hello"
+        )
+    else:
+        terminator = ResponseContentPartDoneEvent.model_construct(
+            type=terminator_type,
+            item_id="item_123",
+            part=ResponseOutputText.model_construct(type="output_text", text="Hello"),
+        )
     chunk = ResponseOutputItemDoneEvent.model_construct(
         type="response.output_item.done",
         item=ResponseOutputMessage.model_construct(
@@ -1120,15 +1128,37 @@ def test_convert_responses_api_chunk_to_lc_chunk_skip_duplicate_after_terminator
         ),
     )
 
-    assert _convert_responses_api_chunk_to_lc_chunk(chunk, previous_chunk) is None
+    streamed_text_by_item: dict[str, str] = {}
+    assert _convert_responses_api_chunk_to_lc_chunk(terminator, streamed_text_by_item) is None
+    result = _convert_responses_api_chunk_to_lc_chunk(chunk, streamed_text_by_item)
+
+    assert isinstance(result, AIMessageChunk)
+    text_content = result.content[0]
+    assert isinstance(text_content, dict)
+    assert text_content["text"] == "Hello"
+
+
+def test_convert_responses_api_chunk_to_lc_chunk_emits_missing_suffix():
+    """A partial delta stream must not cause terminal text to be lost or repeated."""
+    chunk = ResponseOutputItemDoneEvent.model_construct(
+        type="response.output_item.done",
+        item=ResponseOutputMessage.model_construct(
+            type="message",
+            id="item_123",
+            content=[ResponseOutputText.model_construct(type="output_text", text="Hello world")],
+        ),
+    )
+
+    result = _convert_responses_api_chunk_to_lc_chunk(chunk, {"item_123": "Hello"})
+
+    assert isinstance(result, AIMessageChunk)
+    text_content = result.content[0]
+    assert isinstance(text_content, dict)
+    assert text_content["text"] == " world"
 
 
 def test_convert_responses_api_chunk_to_lc_chunk_skip_duplicate_with_annotations():
     """Test _convert_responses_api_chunk_to_lc_chunk skips duplicate text."""
-    previous_chunk = ResponseTextDeltaEvent.model_construct(
-        type="response.output_text.delta", item_id="item_123", delta="Hello"
-    )
-
     chunk = ResponseOutputItemDoneEvent.model_construct(
         type="response.output_item.done",
         item=ResponseOutputMessage.model_construct(
@@ -1144,7 +1174,7 @@ def test_convert_responses_api_chunk_to_lc_chunk_skip_duplicate_with_annotations
         ),
     )
 
-    result = _convert_responses_api_chunk_to_lc_chunk(chunk, previous_chunk)
+    result = _convert_responses_api_chunk_to_lc_chunk(chunk, {"item_123": "Hello"})
 
     assert isinstance(result, AIMessageChunk)
     assert result.id == "item_123"
@@ -1318,6 +1348,14 @@ def test_chat_databricks_responses_api_stream():
         ),
         ResponseTextDeltaEvent.model_construct(
             type="response.output_text.delta", item_id="item_123", delta=" world"
+        ),
+        ResponseTextDoneEvent.model_construct(
+            type="response.output_text.done", item_id="item_123", text="Hello world"
+        ),
+        ResponseContentPartDoneEvent.model_construct(
+            type="response.content_part.done",
+            item_id="item_123",
+            part=ResponseOutputText.model_construct(type="output_text", text="Hello world"),
         ),
         ResponseOutputItemDoneEvent.model_construct(
             type="response.output_item.done",

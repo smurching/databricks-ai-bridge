@@ -800,6 +800,25 @@ def test_chat_databricks_custom_outputs_stream():
     assert any(chunk.custom_outputs["key"] == "value" for chunk in response)  # type: ignore[attr-defined]
 
 
+@pytest.mark.skipif(
+    os.environ.get("RUN_DOGFOOD_TESTS", "").lower() != "true",
+    reason="Requires dogfood workspace. Set RUN_DOGFOOD_TESTS=true to run.",
+)
+def test_chat_databricks_ai_gateway_responses_stream_does_not_duplicate_text():
+    """Unity AI Gateway terminators must not duplicate already-streamed Claude text."""
+    llm = ChatDatabricks(
+        model="system.ai.claude-haiku-4-5",
+        use_responses_api=True,
+        use_ai_gateway=True,
+        stream_usage=False,
+        max_tokens=20,
+    )
+
+    chunks = list(llm.stream("Reply with exactly BRIDGE_STREAM_SENTINEL"))
+
+    assert "".join(chunk.text for chunk in chunks).strip() == "BRIDGE_STREAM_SENTINEL"
+
+
 def test_chat_databricks_token_count():
     llm = ChatDatabricks(model="databricks-gpt-oss-120b")
     response = llm.invoke("What is the 100th fibonacci number?")

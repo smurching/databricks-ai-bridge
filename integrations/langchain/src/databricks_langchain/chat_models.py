@@ -885,11 +885,12 @@ class ChatDatabricks(BaseChatModel):
         final_usage: ResponseUsage | CompletionUsage | dict[str, int] | None = None
 
         if self.use_responses_api:
-            prev_chunk = None
+            streamed_text_by_item: dict[str, str] = {}
             stream: Stream[ResponseStreamEvent] = self.client.responses.create(**data)
             for chunk in stream:
-                chunk_message = _convert_responses_api_chunk_to_lc_chunk(chunk, prev_chunk)
-                prev_chunk = chunk
+                chunk_message = _convert_responses_api_chunk_to_lc_chunk(
+                    chunk, streamed_text_by_item
+                )
                 if chunk_message:
                     yield ChatGenerationChunk(message=chunk_message)
                 # Check for usage in the chunk if available
@@ -990,14 +991,15 @@ class ChatDatabricks(BaseChatModel):
         final_usage: ResponseUsage | CompletionUsage | dict[str, int] | None = None
 
         if self.use_responses_api:
-            prev_chunk = None
+            streamed_text_by_item: dict[str, str] = {}
             stream = cast(
                 AsyncStream[ResponseStreamEvent],
                 await self.async_client.responses.create(**data),
             )
             async for chunk in stream:
-                chunk_message = _convert_responses_api_chunk_to_lc_chunk(chunk, prev_chunk)
-                prev_chunk = chunk
+                chunk_message = _convert_responses_api_chunk_to_lc_chunk(
+                    chunk, streamed_text_by_item
+                )
                 if chunk_message:
                     yield ChatGenerationChunk(message=chunk_message)
                 # Check for usage in the chunk if available
@@ -1713,7 +1715,7 @@ def _convert_dict_to_message_chunk(
 
 
 def _convert_responses_api_chunk_to_lc_chunk(
-    chunk: ResponseStreamEvent, previous_chunk: ResponseStreamEvent | None = None
+    chunk: ResponseStreamEvent, streamed_text_by_item: dict[str, str] | None = None
 ) -> Optional[BaseMessageChunk]:
     # Handle OpenAI responses API chunks
     content = []
@@ -1723,6 +1725,8 @@ def _convert_responses_api_chunk_to_lc_chunk(
 
     if chunk.type == "response.output_text.delta":
         id = getattr(chunk, "item_id", None)
+        if id is not None and streamed_text_by_item is not None:
+            streamed_text_by_item[id] = streamed_text_by_item.get(id, "") + chunk.delta  # ty:ignore[unresolved-attribute]: astral-sh/ty#1479 should fix this
         content.append(
             {
                 "type": "text",
@@ -1747,25 +1751,12 @@ def _convert_responses_api_chunk_to_lc_chunk(
             )
         elif item.type == "message":
             id = item.id
-            # skip text outputs that have already been streamed, but keep the annotations.
-            # Providers close a message with output_text.done and content_part.done before
-            # output_item.done, so those terminators count as "already streamed" too.
-            prev_type = previous_chunk.type if previous_chunk else None
-            prev_item_id = getattr(previous_chunk, "item_id", None) if previous_chunk else None
-            skip_duplicate_text = (
-                previous_chunk
-                and prev_type
-                in (
-                    "response.output_text.delta",
-                    "response.output_text.done",
-                    "response.content_part.done",
-                )
-                and id == prev_item_id
-            )
+            streamed_text = streamed_text_by_item.get(id) if streamed_text_by_item else None
             if item.content is not None:  # ty:ignore[unresolved-attribute]: astral-sh/ty#1479 should fix this
                 for content_item in item.content:  # ty:ignore[unresolved-attribute]: astral-sh/ty#1479 should fix this
                     if content_item.type == "output_text":
-                        if skip_duplicate_text:
+                        terminal_text = content_item.text  # ty:ignore[unresolved-attribute]: astral-sh/ty#1479 should fix this
+                        if streamed_text == terminal_text:
                             if content_item.annotations:  # ty:ignore[unresolved-attribute]: astral-sh/ty#1479 should fix this
                                 # Convert annotation objects to dictionaries
                                 annotations = [
@@ -1782,12 +1773,16 @@ def _convert_responses_api_chunk_to_lc_chunk(
                                     for ann in content_item.annotations  # ty:ignore[unresolved-attribute]: astral-sh/ty#1479 should fix this
                                 ]
 
+                            # If the terminal text extends what was streamed, emit only the
+                            # missing suffix. For absent or inconsistent deltas, preserve the
+                            # complete terminal text rather than losing content.
+                            text = (
+                                terminal_text[len(streamed_text) :]
+                                if streamed_text and terminal_text.startswith(streamed_text)
+                                else terminal_text
+                            )
                             content.append(
-                                {
-                                    "type": "text",
-                                    "text": content_item.text,  # ty:ignore[unresolved-attribute]: astral-sh/ty#1479 should fix this
-                                    "annotations": annotations,
-                                }
+                                {"type": "text", "text": text, "annotations": annotations}
                             )
                     elif content_item.type == "refusal":
                         content.append(
